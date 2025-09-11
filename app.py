@@ -229,8 +229,34 @@ Return valid JSON only in this exact shape:
 # ---------------------------
 #  AGENT: SPEC EXTRACTOR
 # ---------------------------
-def extract_spec_checklist(spec_text: str):
-    prompt = f"""
+def extract_spec_checklist(spec_text: str, package_type: str = None, package_summary: str = None):
+    """
+    Extract submittal requirements from spec, optionally filtered by package type.
+    If package_type is provided, only extract requirements relevant to that type.
+    """
+    if package_type and package_summary:
+        prompt = f"""
+You are an expert construction spec analyst.
+
+A submittal package of type "{package_type}" has been uploaded with the following summary:
+"{package_summary}"
+
+Extract ONLY the submittal requirements from the spec below that are RELEVANT to this specific package type and content. 
+Ignore requirements for other trades, materials, or systems that don't apply to this submittal.
+
+Output valid JSON only in this format:
+{{"submittals": [ {{ "id": "S.1", "text": "Submit product data for Portland cement." }}, ... ] }}
+
+Focus on requirements that match or relate to: {package_type}
+
+--- SPEC START ---
+{spec_text}
+--- SPEC END ---
+"""
+        print(prompt)
+    else:
+        # Fallback to original behavior if no package info provided
+        prompt = f"""
 You are an expert construction spec analyst.
 Extract ALL submittal requirements from the spec below. Output valid JSON only in this format:
 {{"submittals": [ {{ "id": "S.1", "text": "Submit product data for Portland cement." }}, ... ] }}
@@ -239,6 +265,7 @@ Extract ALL submittal requirements from the spec below. Output valid JSON only i
 {spec_text}
 --- SPEC END ---
 """
+    
     schema = {
         "type": "object",
         "properties": {
@@ -258,7 +285,9 @@ Extract ALL submittal requirements from the spec below. Output valid JSON only i
         "required": ["submittals"],
         "additionalProperties": False
     }
-    parsed = _call_structured(prompt, "spec_checklist", schema, "You are an expert construction spec analyst.")
+    
+    system_prompt = "You are an expert construction spec analyst focused on extracting relevant submittal requirements."
+    parsed = _call_structured(prompt, "spec_checklist", schema, system_prompt)
     return normalize_checklist(parsed)
 
 
@@ -452,10 +481,14 @@ def main():
             st.write("**Summary:**", st.session_state.classification.get("summary", ""))
 
             # Step 2: extract checklist
-            with st.spinner("Extracting checklist from spec..."):
-                raw_checklist = extract_spec_checklist(st.session_state.spec_text)
+            with st.spinner("Extracting relevant checklist from spec..."):
+                raw_checklist = extract_spec_checklist(
+                    st.session_state.spec_text,
+                    package_type=st.session_state.classification.get("package_type"),
+                    package_summary=st.session_state.classification.get("summary")
+                )
                 st.session_state.checklist = normalize_checklist(raw_checklist)
-            st.success(f"Found {len(st.session_state.checklist.get('submittals', []))} submittal requirements.")
+            st.success(f"Found {len(st.session_state.checklist.get('submittals', []))} relevant submittal requirements.")
             st.json(st.session_state.checklist)
 
             # Step 3: verify each checklist item (parallel)
