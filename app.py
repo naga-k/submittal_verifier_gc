@@ -499,8 +499,9 @@ def main():
             total_items = len(checklist_items)
             pkg_type = st.session_state.classification.get("package_type", "Unknown")
 
-            # Create a stable container for the results table
-            results_placeholder = st.empty()
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
             # Initialize ordered findings
             ordered_findings = [
@@ -509,6 +510,7 @@ def main():
             ]
 
             try:
+                completed_count = 0
                 for res in verify_submittal_parallel(
                     st.session_state.checklist, st.session_state.submittal_text, pkg_type, max_workers=4
                 ):
@@ -522,47 +524,56 @@ def main():
                         "evidence": str(res.get("evidence", "")) if isinstance(res, dict) else "",
                     }
                     findings_by_index[int(idx)] = norm
+                    completed_count += 1
+                    
+                    # Update progress
+                    progress = completed_count / total_items
+                    progress_bar.progress(progress)
+                    status_text.text(f"Verified {completed_count}/{total_items} requirements...")
 
-                    # Update ordered findings
-                    ordered_findings = [
-                        findings_by_index.get(i, {"req_id": checklist_items[i].get("id", ""), "status": "PENDING", "evidence": ""})
-                        for i in range(total_items)
-                    ]
-
-                    # Prepare rows for display
-                    rows = []
-                    for i, f in enumerate(ordered_findings):
-                        req_text = checklist_items[i].get("text", checklist_items[i].get("id", ""))
-                        rows.append({
-                            "Requirement": req_text,
-                            "Status": (f.get("status") or "").upper(),
-                            "Evidence": f.get("evidence", ""),
-                        })
-
-                    # Update the display using the stable container
-                    with results_placeholder.container():
-                        _render_rows_with_columns(st, rows)
+                # Clear progress indicators
+                progress_bar.empty()
+                status_text.empty()
                         
             finally:
+                # Create final ordered findings
+                ordered_findings = [
+                    findings_by_index.get(i, {"req_id": checklist_items[i].get("id", ""), "status": "unclear", "evidence": ""})
+                    for i in range(total_items)
+                ]
+                
                 # persist final results once the whole run completes
                 st.session_state.findings = ordered_findings
                 st.session_state.run_analysis = False
                 st.session_state.analysis_done = True
 
         if st.session_state.analysis_done:
-            st.subheader("Results")
+            st.subheader("📊 Verification Results")
+            
+            # Summary metrics
+            total = len(st.session_state.findings)
+            present = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "present")
+            missing = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "missing")
+            not_applicable = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "not_applicable")
+            unclear = total - present - missing - not_applicable
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("✅ Present", present)
+            col2.metric("❌ Missing", missing)
+            col3.metric("⚫ Not Applicable", not_applicable)
+            col4.metric("❓ Unclear", unclear)
+            
+            # Get checklist items for requirement text
+            checklist_items = st.session_state.checklist.get("submittals", [])
+            
             final_rows = []
-            for f in st.session_state.findings:
+            for i, f in enumerate(st.session_state.findings):
+                req_text = checklist_items[i].get("text", f.get("req_id", "")) if i < len(checklist_items) else f.get("req_id", "")
                 final_rows.append({
-                    "Requirement": f.get("req_id", ""),
+                    "Requirement": req_text,
                     "Status": (f.get("status") or "").upper(),
                     "Evidence": f.get("evidence", ""),
                 })
 
-            # Render final results with Streamlit columns to avoid compressed Status column
-            results_container = st.container()
-            _render_rows_with_columns(results_container, final_rows)
-
-
-if __name__ == "__main__":
-    main()
+            # Render final results
+            _render_rows_with_columns(st, final_rows)
