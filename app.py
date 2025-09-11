@@ -1,10 +1,13 @@
 import re
 import streamlit as st
-from pypdf import PdfReader
 from openai import OpenAI
 import json
 import time
 import concurrent.futures
+import tempfile
+import os
+import base64
+import pymupdf
 
 # ---------------------------
 #  CONFIG
@@ -20,9 +23,159 @@ client = OpenAI(api_key=API_KEY)
 # ---------------------------
 #  UTILS
 # ---------------------------
+def gpt_ocr(image_path: str, model: str = "gpt-4o-mini", detail: str = "low") -> str:
+    """
+    OCR an image using OpenAI Vision API.
+    
+    Args:
+        image_path: Path to the image file
+        model: OpenAI model to use (e.g., "gpt-4o-mini")
+        detail: Image detail level ("low", "high")
+    
+    Returns:
+        Extracted text from the image
+    """
+    try:
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this image. Return only the text content, no explanations or formatting."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_image}",
+                                "detail": detail
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4000
+        )
+        
+        return response.choices[0].message.content or ""
+    except Exception as e:
+        st.warning(f"OCR failed for {image_path}: {str(e)}")
+        return ""
+
+
+def extract_pdf_with_ocr(uploaded_file, max_workers: int = 4) -> str:
+    """
+    Extract text from PDF with OCR fallback for blank pages.
+    Uses PyMuPDF (pymupdf) for both text extraction and rasterization.
+    """
+    # Save uploaded file to temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        pdf_path = tmp_file.name
+
+    doc = None
+    try:
+        # Open with PyMuPDF
+        doc = pymupdf.open(pdf_path)
+        page_texts = []
+        blank_pages = []
+
+        st.write(f"📄 Analyzing {len(doc)} pages...")
+        for i in range(len(doc)):
+            page = doc.load_page(i)
+            txt = (page.get_text("text") or "").strip()
+            if not txt:
+                blank_pages.append(i)
+                page_texts.append("")  # placeholder for OCR
+            else:
+                page_texts.append(txt)
+
+        if blank_pages:
+            st.write(f"🔍 Found {len(blank_pages)} blank pages requiring OCR: {[p+1 for p in blank_pages]}")
+            image_paths = []
+            with tempfile.TemporaryDirectory() as temp_dir:
+                for i in blank_pages:
+                    try:
+                        page = doc.load_page(i)
+                        pix = page.get_pixmap(dpi=200)
+                        img_path = os.path.join(temp_dir, f"page_{i+1}.png")
+                        pix.save(img_path)
+                        image_paths.append((i, img_path))
+                    except Exception as e:
+                        st.warning(f"Failed to convert page {i+1} to image: {e}")
+
+                # close doc after images are created
+                doc.close()
+                doc = None
+
+                if image_paths:
+                    st.write(f"🤖 Running OCR on {len(image_paths)} pages...")
+
+                    def ocr_worker(page_data):
+                        idx, img_path = page_data
+                        try:
+                            ocr_text = gpt_ocr(img_path, "gpt-4o-mini", "low")
+                            return idx, ocr_text
+                        except Exception as e:
+                            st.warning(f"OCR failed for page {idx+1}: {e}")
+                            return idx, ""
+
+                    workers = min(max_workers, max(1, len(image_paths)))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        futures = [executor.submit(ocr_worker, pd) for pd in image_paths]
+                        completed = 0
+                        for fut in concurrent.futures.as_completed(futures):
+                            idx, ocr_txt = fut.result()
+                            page_texts[idx] = ocr_txt
+                            completed += 1
+                            progress_bar.progress(completed / len(image_paths))
+                            status_text.text(f"OCR completed: {completed}/{len(image_paths)} pages")
+                        progress_bar.empty()
+                        status_text.empty()
+                    st.success(f"✅ OCR completed for {len(image_paths)} pages")
+        else:
+            st.write("✅ All pages contain extractable text, no OCR needed")
+
+        # 4. Merge results
+        final_text = "\n\n".join(page_texts)
+
+        # Diagnostics - FIX THE MATH
+        total_chars = len(final_text)
+        if blank_pages:
+            ocr_chars = sum(len(page_texts[i]) for i in blank_pages)
+            regular_chars = total_chars - ocr_chars
+            st.write(f"📊 Regular pages: {regular_chars:,} chars, OCR pages: {ocr_chars:,} chars")
+            st.write(f"📊 OCR added {ocr_chars:,} characters from {len(blank_pages)} pages")
+        st.write(f"📄 Total text extracted: {total_chars:,} characters")
+
+        return final_text
+
+    finally:
+        # ensure document closed and temp pdf removed
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(pdf_path)
+        except Exception:
+            pass
+
+
 def extract_text_from_pdf(uploaded_file) -> str:
-    reader = PdfReader(uploaded_file)
-    return "\n".join([page.extract_text() or "" for page in reader.pages])
+    """
+    Enhanced PDF text extraction with OCR fallback.
+    This replaces the original simple extraction function.
+    """
+    return extract_pdf_with_ocr(uploaded_file, max_workers=4)
 
 
 def ask_llm(prompt: str) -> str:
@@ -253,7 +406,6 @@ Focus on requirements that match or relate to: {package_type}
 {spec_text}
 --- SPEC END ---
 """
-        print(prompt)
     else:
         # Fallback to original behavior if no package info provided
         prompt = f"""
@@ -577,3 +729,6 @@ def main():
 
             # Render final results
             _render_rows_with_columns(st, final_rows)
+
+if __name__ == "__main__":
+    main()
