@@ -100,7 +100,7 @@ def normalize_checklist(obj):
 # ---------------------------
 # UI RENDER HELPERS (moved to top-level)
 # ---------------------------
-def _render_rows_with_columns(container, rows, col_widths=(6, 1, 3)):
+def _render_rows_with_columns(container, rows, col_widths=(3, 1, 6)):
     """
     Render header + rows using Streamlit columns. Use consistent column widths
     so layout doesn't collapse when called repeatedly.
