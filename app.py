@@ -5,6 +5,7 @@ from openai import OpenAI
 import json
 import time
 import concurrent.futures
+import os
 
 # ---------------------------
 #  CONFIG
@@ -25,12 +26,82 @@ def extract_text_from_pdf(uploaded_file) -> str:
     return "\n".join([page.extract_text() or "" for page in reader.pages])
 
 
-def ask_llm(prompt: str) -> str:
+# NEW: chunked extraction + formatting + optional logging
+def log_cleaned_pdf_text(text: str, filename: str) -> str | None:
     """
-    Uses OpenAI Responses API (gpt-5-mini). Returns best-effort plain text.
+    Writes cleaned text to ./temp/{filename}.
+    Returns filepath on success, None on failure.
+    """
+    try:
+        os.makedirs("temp", exist_ok=True)
+        filepath = os.path.join("temp", filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(text)
+        return filepath
+    except Exception:
+        return None
+
+
+def extract_and_format_pdf(uploaded_file, chunk_size: int = 5, enable_logging: bool = False, label: str = "document") -> str:
+    """
+    Extracts PDF text page-by-page, chunks into `chunk_size` pages,
+    sends each chunk to the LLM formatter (ask_llm) and preserves page markers.
+
+    Returns the concatenated cleaned/formatted text (with page markers).
+    Optionally writes cleaned text to cleaned_{label}.txt when enable_logging=True.
+    """
+    reader = PdfReader(uploaded_file)
+    pages = [page.extract_text() or "" for page in reader.pages]
+    if not pages:
+        return ""
+
+    # sanitize chunk_size bounds (1..10)
+    chunk_size = max(1, min(int(chunk_size), 10))
+    cleaned_chunks = []
+
+    for start in range(0, len(pages), chunk_size):
+        chunk_pages = pages[start : start + chunk_size]
+
+        # Build page-marked text for this chunk. Preserve markers exactly.
+        formatted_input = ""
+        for i, raw_text in enumerate(chunk_pages):
+            page_number = start + i + 1
+            formatted_input += f"--- PAGE {page_number} START ---\n{raw_text}\n--- PAGE {page_number} END ---\n\n"
+
+        prompt = f"""
+You are a PDF formatting assistant. Clean and format the text below.
+Keep all numbers, tables, and units intact.
+Always preserve page markers exactly as provided.
+
+{formatted_input}
+"""
+        try:
+            # use gpt-5-nano for PDF formatting per request
+            formatted_output = ask_llm(prompt, model="gpt-5-nano") or ""
+        except Exception:
+            formatted_output = formatted_input  # fallback to raw page-marked text
+        cleaned_chunks.append(formatted_output.strip())
+
+    full_cleaned_text = "\n\n".join([c for c in cleaned_chunks if c])
+
+    if enable_logging:
+        filename = f"cleaned_{label}.txt"
+        saved = log_cleaned_pdf_text(full_cleaned_text, filename)
+        if saved:
+            # Note: Streamlit UI will show an info message where this function is called.
+            pass
+
+    return full_cleaned_text
+
+
+def ask_llm(prompt: str, model: str = "gpt-5-mini") -> str:
+    """
+    Uses OpenAI Responses API. Default model gpt-5-mini.
+    Accepts optional model override (e.g., 'gpt-5-nano' for formatting).
+    Returns best-effort plain text.
     """
     resp = client.responses.create(
-        model="gpt-5-mini",
+        model=model,
         input=[
             {"role": "system", "content": "You are a construction workflow assistant and GC project manager."},
             {"role": "user", "content": prompt},
@@ -271,6 +342,9 @@ def main():
     with col2:
         submittal_file = st.file_uploader("Upload Submittal PDF", type=["pdf"])
 
+    # NEW: logging toggle
+    enable_logging = st.checkbox("Enable PDF Text Logging (writes cleaned_spec.txt / cleaned_submittal.txt)", value=False)
+
     # persistent state
     st.session_state.setdefault("uploaded_names", (None, None))
     st.session_state.setdefault("spec_text", None)
@@ -295,11 +369,22 @@ def main():
 
         st.success("✅ Files uploaded")
         if not st.session_state.spec_text:
-            with st.spinner("Reading spec..."):
-                st.session_state.spec_text = extract_text_from_pdf(spec_file)
+            with st.spinner("Extracting + formatting spec PDF..."):
+                cleaned = extract_and_format_pdf(
+                    spec_file, chunk_size=5, enable_logging=enable_logging, label="spec"
+                )
+                st.session_state.spec_text = cleaned
+                if enable_logging:
+                    st.info(f"📝 Logged cleaned spec text to ./temp/cleaned_spec.txt")
+
         if not st.session_state.submittal_text:
-            with st.spinner("Reading submittal..."):
-                st.session_state.submittal_text = extract_text_from_pdf(submittal_file)
+            with st.spinner("Extracting + formatting submittal PDF..."):
+                cleaned = extract_and_format_pdf(
+                    submittal_file, chunk_size=5, enable_logging=enable_logging, label="submittal"
+                )
+                st.session_state.submittal_text = cleaned
+                if enable_logging:
+                    st.info(f"📝 Logged cleaned submittal text to ./temp/cleaned_submittal.txt")
 
         st.subheader("Ready to analyze")
         if st.button("Start LLM Analysis"):
