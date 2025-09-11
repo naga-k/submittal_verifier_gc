@@ -98,6 +98,101 @@ def normalize_checklist(obj):
 
 
 # ---------------------------
+# UI RENDER HELPERS (moved to top-level)
+# ---------------------------
+def _render_rows_with_columns(container, rows, col_widths=(6, 1, 3)):
+    """
+    Render header + rows using Streamlit columns. Use consistent column widths
+    so layout doesn't collapse when called repeatedly.
+    """
+    hdr_req, hdr_status, hdr_ev = container.columns(list(col_widths))
+    hdr_req.markdown("**Requirement**")
+    hdr_status.markdown("**Status**")
+    hdr_ev.markdown("**Evidence**")
+    for r in rows:
+        c_req, c_status, c_ev = container.columns(list(col_widths))
+        c_req.write(r.get("Requirement", ""))
+        c_status.markdown(f"**{r.get('Status','')}**")
+        c_ev.write(r.get("Evidence", ""))
+
+
+def _call_structured(prompt: str, schema_name: str, schema: dict, system_role: str):
+    """
+    Use Responses API Structured Outputs via the `text.format` param (json_schema).
+    Prefer resp.output_parsed when available. Fall back to older clients by removing
+    the `text` param and parsing output_text / raw pieces.
+    Uses model "gpt-5-mini" (supports structured outputs).
+    """
+    payload = {
+        "model": "gpt-5-mini",
+        "input": [
+            {"role": "system", "content": system_role},
+            {"role": "user", "content": prompt},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    }
+
+    try:
+        resp = client.responses.create(**payload)
+    except TypeError:
+        # older SDK doesn't accept `text` structured param -> fallback to plain call
+        fallback = {
+            "model": payload["model"],
+            "input": payload["input"],
+        }
+        resp = client.responses.create(**fallback)
+
+    # If the SDK parsed structured output for us, return it
+    parsed = getattr(resp, "output_parsed", None)
+    if parsed is not None:
+        return parsed
+
+    # Handle incomplete/refusal cases quickly
+    if getattr(resp, "status", None) == "incomplete":
+        try:
+            if getattr(resp, "incomplete_details", {}).get("reason") == "max_output_tokens":
+                return None
+        except Exception:
+            pass
+
+    # Fallbacks: prefer output_text then harvest raw pieces and try to parse JSON
+    text = getattr(resp, "output_text", None)
+    if text:
+        try:
+            return json.loads(text)
+        except Exception:
+            frag = parse_llm_json(text)
+            if frag is not None:
+                return frag
+
+    try:
+        pieces = []
+        for out in getattr(resp, "output", []) or []:
+            for item in out.get("content", []):
+                if item.get("type") == "output_text":
+                    pieces.append(item.get("text", ""))
+                elif item.get("type") == "refusal":
+                    return {"_refusal": item.get("refusal")}
+        joined = "\n".join(pieces)
+        if joined:
+            try:
+                return json.loads(joined)
+            except Exception:
+                return parse_llm_json(joined)
+    except Exception:
+        pass
+
+    return None
+
+
+# ---------------------------
 #  AGENT: SUBMITTAL PACKAGE CLASSIFIER
 # ---------------------------
 def classify_submittal_package(submittal_text: str, submittal_filename: str):
@@ -116,8 +211,16 @@ Return valid JSON only in this exact shape:
 {submittal_text}
 --- SUBMITTAL TEXT END ---
 """
-    result = ask_llm(prompt)
-    parsed = parse_llm_json(result)
+    schema = {
+        "type": "object",
+        "properties": {
+            "package_type": {"type": "string"},
+            "summary": {"type": "string"}
+        },
+        "required": ["package_type", "summary"],
+        "additionalProperties": False
+    }
+    parsed = _call_structured(prompt, "classification", schema, "You are a GC Project Manager.")
     if isinstance(parsed, dict) and parsed.get("package_type"):
         return {"package_type": str(parsed.get("package_type")), "summary": str(parsed.get("summary", ""))}
     return {"package_type": "Unknown", "summary": "Could not determine the type of submittal package."}
@@ -136,21 +239,43 @@ Extract ALL submittal requirements from the spec below. Output valid JSON only i
 {spec_text}
 --- SPEC END ---
 """
-    result = ask_llm(prompt)
-    parsed = parse_llm_json(result)
-    checklist = normalize_checklist(parsed)
-    return checklist
+    schema = {
+        "type": "object",
+        "properties": {
+            "submittals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "text": {"type": "string"}
+                    },
+                    "required": ["id", "text"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["submittals"],
+        "additionalProperties": False
+    }
+    parsed = _call_structured(prompt, "spec_checklist", schema, "You are an expert construction spec analyst.")
+    return normalize_checklist(parsed)
 
 
 # ---------------------------
 #  AGENT: PACKAGE VERIFIER
 # ---------------------------
 def verify_submittal(checklist: dict, submittal_text: str, package_type: str):
-    """
-    Generator: yields parsed finding dicts for each checklist item.
-    Finding shape:
-      {"req_id": "...", "status": "present|missing|not_applicable|unclear", "evidence": "..."}
-    """
+    find_schema = {
+        "type": "object",
+        "properties": {
+            "req_id": {"type": "string"},
+            "status": {"type": "string", "enum": ["present", "missing", "not_applicable", "unclear"]},
+            "evidence": {"type": "string"}
+        },
+        "required": ["req_id", "status"]
+    }
+
     for item in checklist.get("submittals", []):
         req_id = item.get("id")
         req_text = item.get("text", "")
@@ -174,9 +299,7 @@ Example:
 {submittal_text}
 --- SUBMITTAL TEXT END ---
 """
-        result = ask_llm(prompt)
-        parsed = parse_llm_json(result)
-        # normalize parsed into a single dict finding
+        parsed = _call_structured(prompt, "verification", find_schema, "You are a GC PM verifying a submittal package for completeness.")
         finding = None
         if isinstance(parsed, dict):
             finding = parsed
@@ -184,15 +307,11 @@ Example:
             first = parsed[0]
             if isinstance(first, dict):
                 finding = first
-
         if not isinstance(finding, dict):
             finding = {"req_id": req_id, "status": "unclear", "evidence": ""}
-
-        # Ensure keys exist and req_id preserved
         finding.setdefault("req_id", req_id)
         finding.setdefault("status", "unclear")
         finding.setdefault("evidence", "")
-
         yield {"req_id": str(finding["req_id"]), "status": str(finding["status"]), "evidence": str(finding["evidence"])}
         time.sleep(0.12)
 
@@ -229,9 +348,23 @@ Example:
 {submittal_text}
 --- SUBMITTAL TEXT END ---
 """
+        find_schema = {
+            "type": "object",
+            "properties": {
+                "req_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["present", "missing", "not_applicable", "unclear"]},
+                "evidence": {"type": "string"}
+            },
+            "required": ["req_id", "status", "evidence"],
+            "additionalProperties": False
+        }
+
         try:
-            result = ask_llm(prompt)
-            parsed = parse_llm_json(result)
+            parsed = _call_structured(prompt, "verification", find_schema, "You are a GC PM verifying a submittal package for completeness.")
+            # handle refusal
+            if isinstance(parsed, dict) and parsed.get("_refusal"):
+                return {"index": index, "req_id": req_id, "status": "unclear", "evidence": f"refusal: {parsed.get('_refusal')}"}
+
             finding = None
             if isinstance(parsed, dict):
                 finding = parsed
@@ -239,10 +372,10 @@ Example:
                 first = parsed[0]
                 if isinstance(first, dict):
                     finding = first
+
             if not isinstance(finding, dict):
                 finding = {"req_id": req_id, "status": "unclear", "evidence": ""}
 
-            # ensure keys exist
             finding.setdefault("req_id", req_id)
             finding.setdefault("status", "unclear")
             finding.setdefault("evidence", "")
@@ -327,31 +460,43 @@ def main():
 
             # Step 3: verify each checklist item (parallel)
             st.subheader("Verifying completeness")
-            findings_container = st.empty()
-
+            
             checklist_items = st.session_state.checklist.get("submittals", [])
-            findings_by_index = {}  # store results by original checklist order
+            findings_by_index = {}
             total_items = len(checklist_items)
             pkg_type = st.session_state.classification.get("package_type", "Unknown")
 
-            for res in verify_submittal_parallel(st.session_state.checklist, st.session_state.submittal_text, pkg_type, max_workers=4):
-                # normalize res into dict with index
-                idx = res.get("index") if isinstance(res, dict) else None
-                if idx is None:
-                    # fallback: append at end (shouldn't happen if parallel returns index)
-                    idx = len(findings_by_index)
-                norm = {
-                    "req_id": str(res.get("req_id", "")) if isinstance(res, dict) else str(res),
-                    "status": str(res.get("status", "unclear")) if isinstance(res, dict) else "unclear",
-                    "evidence": str(res.get("evidence", "")) if isinstance(res, dict) else "",
-                }
-                findings_by_index[int(idx)] = norm
-                # persist ordered list in session_state
-                ordered_findings = [findings_by_index.get(i, {"req_id": checklist_items[i].get("id",""), "status":"PENDING", "evidence":""}) for i in range(total_items)]
-                st.session_state.findings = ordered_findings
+            # Create a stable container for the results table
+            results_placeholder = st.empty()
+            
+            # Initialize ordered findings
+            ordered_findings = [
+                {"req_id": checklist_items[i].get("id", ""), "status": "PENDING", "evidence": ""}
+                for i in range(total_items)
+            ]
 
-                # render table in original checklist order using checklist text as Requirement column
-                with findings_container:
+            try:
+                for res in verify_submittal_parallel(
+                    st.session_state.checklist, st.session_state.submittal_text, pkg_type, max_workers=4
+                ):
+                    idx = res.get("index") if isinstance(res, dict) else None
+                    if idx is None:
+                        idx = len(findings_by_index)
+                    
+                    norm = {
+                        "req_id": str(res.get("req_id", "")) if isinstance(res, dict) else str(res),
+                        "status": str(res.get("status", "unclear")) if isinstance(res, dict) else "unclear",
+                        "evidence": str(res.get("evidence", "")) if isinstance(res, dict) else "",
+                    }
+                    findings_by_index[int(idx)] = norm
+
+                    # Update ordered findings
+                    ordered_findings = [
+                        findings_by_index.get(i, {"req_id": checklist_items[i].get("id", ""), "status": "PENDING", "evidence": ""})
+                        for i in range(total_items)
+                    ]
+
+                    # Prepare rows for display
                     rows = []
                     for i, f in enumerate(ordered_findings):
                         req_text = checklist_items[i].get("text", checklist_items[i].get("id", ""))
@@ -360,58 +505,30 @@ def main():
                             "Status": (f.get("status") or "").upper(),
                             "Evidence": f.get("evidence", ""),
                         })
-                    st.table(rows)
 
-            st.session_state.analysis_done = True
-            st.session_state.run_analysis = False
+                    # Update the display using the stable container
+                    with results_placeholder.container():
+                        _render_rows_with_columns(st, rows)
+                        
+            finally:
+                # persist final results once the whole run completes
+                st.session_state.findings = ordered_findings
+                st.session_state.run_analysis = False
+                st.session_state.analysis_done = True
 
         if st.session_state.analysis_done:
             st.subheader("Results")
-            st.table([{
-                "Requirement": f.get("req_id", ""),
-                "Status": (f.get("status") or "").upper(),
-                "Evidence": f.get("evidence", ""),
-            } for f in st.session_state.findings])
+            final_rows = []
+            for f in st.session_state.findings:
+                final_rows.append({
+                    "Requirement": f.get("req_id", ""),
+                    "Status": (f.get("status") or "").upper(),
+                    "Evidence": f.get("evidence", ""),
+                })
 
-            # Human-facing summary counts
-            findings = st.session_state.findings or []
-            total_spec_items = len(st.session_state.checklist.get("submittals", []))
-            present = sum(1 for f in findings if (f.get("status") or "").lower() == "present")
-            missing = sum(1 for f in findings if (f.get("status") or "").lower() == "missing")
-            not_applicable = sum(1 for f in findings if (f.get("status") or "").lower() == "not_applicable")
-            unclear = sum(1 for f in findings if (f.get("status") or "").lower() == "unclear")
-            applicable = total_spec_items - not_applicable
-
-            st.subheader("Summary")
-            pkg_type = st.session_state.classification.get("package_type", "Unknown")
-            human_summary = (
-                f"This appears to be a {pkg_type} submittal. The spec requires {total_spec_items} documents in total; "
-                f"{applicable} apply to this package: {present} present, {missing} missing, {not_applicable} not applicable, {unclear} unclear."
-            )
-            st.write(human_summary)
-
-            report = {
-                "classification": st.session_state.classification,
-                "checklist": st.session_state.checklist,
-                "findings": findings,
-                "summary": {
-                    "total_spec_items": total_spec_items,
-                    "applicable": applicable,
-                    "present": present,
-                    "missing": missing,
-                    "not_applicable": not_applicable,
-                    "unclear": unclear,
-                    "human_summary": human_summary,
-                },
-            }
-
-            st.subheader("Download Report")
-            st.download_button(
-                label="📥 Download JSON Report",
-                data=json.dumps(report, indent=2),
-                file_name="submittal_report.json",
-                mime="application/json",
-            )
+            # Render final results with Streamlit columns to avoid compressed Status column
+            results_container = st.container()
+            _render_rows_with_columns(results_container, final_rows)
 
 
 if __name__ == "__main__":
