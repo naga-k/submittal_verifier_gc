@@ -1,10 +1,13 @@
 import re
 import streamlit as st
-from pypdf import PdfReader
 from openai import OpenAI
 import json
 import time
 import concurrent.futures
+import tempfile
+import os
+import base64
+import pymupdf
 
 # ---------------------------
 #  CONFIG
@@ -20,9 +23,159 @@ client = OpenAI(api_key=API_KEY)
 # ---------------------------
 #  UTILS
 # ---------------------------
+def gpt_ocr(image_path: str, model: str = "gpt-4o-mini", detail: str = "low") -> str:
+    """
+    OCR an image using OpenAI Vision API.
+    
+    Args:
+        image_path: Path to the image file
+        model: OpenAI model to use (e.g., "gpt-4o-mini")
+        detail: Image detail level ("low", "high")
+    
+    Returns:
+        Extracted text from the image
+    """
+    try:
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this image. Return only the text content, no explanations or formatting."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_image}",
+                                "detail": detail
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4000
+        )
+        
+        return response.choices[0].message.content or ""
+    except Exception as e:
+        st.warning(f"OCR failed for {image_path}: {str(e)}")
+        return ""
+
+
+def extract_pdf_with_ocr(uploaded_file, max_workers: int = 4) -> str:
+    """
+    Extract text from PDF with OCR fallback for blank pages.
+    Uses PyMuPDF (pymupdf) for both text extraction and rasterization.
+    """
+    # Save uploaded file to temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        pdf_path = tmp_file.name
+
+    doc = None
+    try:
+        # Open with PyMuPDF
+        doc = pymupdf.open(pdf_path)
+        page_texts = []
+        blank_pages = []
+
+        st.write(f"📄 Analyzing {len(doc)} pages...")
+        for i in range(len(doc)):
+            page = doc.load_page(i)
+            txt = (page.get_text("text") or "").strip()
+            if not txt:
+                blank_pages.append(i)
+                page_texts.append("")  # placeholder for OCR
+            else:
+                page_texts.append(txt)
+
+        if blank_pages:
+            st.write(f"🔍 Found {len(blank_pages)} blank pages requiring OCR: {[p+1 for p in blank_pages]}")
+            image_paths = []
+            with tempfile.TemporaryDirectory() as temp_dir:
+                for i in blank_pages:
+                    try:
+                        page = doc.load_page(i)
+                        pix = page.get_pixmap(dpi=200)
+                        img_path = os.path.join(temp_dir, f"page_{i+1}.png")
+                        pix.save(img_path)
+                        image_paths.append((i, img_path))
+                    except Exception as e:
+                        st.warning(f"Failed to convert page {i+1} to image: {e}")
+
+                # close doc after images are created
+                doc.close()
+                doc = None
+
+                if image_paths:
+                    st.write(f"🤖 Running OCR on {len(image_paths)} pages...")
+
+                    def ocr_worker(page_data):
+                        idx, img_path = page_data
+                        try:
+                            ocr_text = gpt_ocr(img_path, "gpt-4o-mini", "low")
+                            return idx, ocr_text
+                        except Exception as e:
+                            st.warning(f"OCR failed for page {idx+1}: {e}")
+                            return idx, ""
+
+                    workers = min(max_workers, max(1, len(image_paths)))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        futures = [executor.submit(ocr_worker, pd) for pd in image_paths]
+                        completed = 0
+                        for fut in concurrent.futures.as_completed(futures):
+                            idx, ocr_txt = fut.result()
+                            page_texts[idx] = ocr_txt
+                            completed += 1
+                            progress_bar.progress(completed / len(image_paths))
+                            status_text.text(f"OCR completed: {completed}/{len(image_paths)} pages")
+                        progress_bar.empty()
+                        status_text.empty()
+                    st.success(f"✅ OCR completed for {len(image_paths)} pages")
+        else:
+            st.write("✅ All pages contain extractable text, no OCR needed")
+
+        # 4. Merge results
+        final_text = "\n\n".join(page_texts)
+
+        # Diagnostics - FIX THE MATH
+        total_chars = len(final_text)
+        if blank_pages:
+            ocr_chars = sum(len(page_texts[i]) for i in blank_pages)
+            regular_chars = total_chars - ocr_chars
+            st.write(f"📊 Regular pages: {regular_chars:,} chars, OCR pages: {ocr_chars:,} chars")
+            st.write(f"📊 OCR added {ocr_chars:,} characters from {len(blank_pages)} pages")
+        st.write(f"📄 Total text extracted: {total_chars:,} characters")
+
+        return final_text
+
+    finally:
+        # ensure document closed and temp pdf removed
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(pdf_path)
+        except Exception:
+            pass
+
+
 def extract_text_from_pdf(uploaded_file) -> str:
-    reader = PdfReader(uploaded_file)
-    return "\n".join([page.extract_text() or "" for page in reader.pages])
+    """
+    Enhanced PDF text extraction with OCR fallback.
+    This replaces the original simple extraction function.
+    """
+    return extract_pdf_with_ocr(uploaded_file, max_workers=4)
 
 
 def ask_llm(prompt: str) -> str:
@@ -229,8 +382,33 @@ Return valid JSON only in this exact shape:
 # ---------------------------
 #  AGENT: SPEC EXTRACTOR
 # ---------------------------
-def extract_spec_checklist(spec_text: str):
-    prompt = f"""
+def extract_spec_checklist(spec_text: str, package_type: str = None, package_summary: str = None):
+    """
+    Extract submittal requirements from spec, optionally filtered by package type.
+    If package_type is provided, only extract requirements relevant to that type.
+    """
+    if package_type and package_summary:
+        prompt = f"""
+You are an expert construction spec analyst.
+
+A submittal package of type "{package_type}" has been uploaded with the following summary:
+"{package_summary}"
+
+Extract ONLY the submittal requirements from the spec below that are RELEVANT to this specific package type and content. 
+Ignore requirements for other trades, materials, or systems that don't apply to this submittal.
+
+Output valid JSON only in this format:
+{{"submittals": [ {{ "id": "S.1", "text": "Submit product data for Portland cement." }}, ... ] }}
+
+Focus on requirements that match or relate to: {package_type}
+
+--- SPEC START ---
+{spec_text}
+--- SPEC END ---
+"""
+    else:
+        # Fallback to original behavior if no package info provided
+        prompt = f"""
 You are an expert construction spec analyst.
 Extract ALL submittal requirements from the spec below. Output valid JSON only in this format:
 {{"submittals": [ {{ "id": "S.1", "text": "Submit product data for Portland cement." }}, ... ] }}
@@ -239,6 +417,7 @@ Extract ALL submittal requirements from the spec below. Output valid JSON only i
 {spec_text}
 --- SPEC END ---
 """
+    
     schema = {
         "type": "object",
         "properties": {
@@ -258,7 +437,9 @@ Extract ALL submittal requirements from the spec below. Output valid JSON only i
         "required": ["submittals"],
         "additionalProperties": False
     }
-    parsed = _call_structured(prompt, "spec_checklist", schema, "You are an expert construction spec analyst.")
+    
+    system_prompt = "You are an expert construction spec analyst focused on extracting relevant submittal requirements."
+    parsed = _call_structured(prompt, "spec_checklist", schema, system_prompt)
     return normalize_checklist(parsed)
 
 
@@ -452,10 +633,14 @@ def main():
             st.write("**Summary:**", st.session_state.classification.get("summary", ""))
 
             # Step 2: extract checklist
-            with st.spinner("Extracting checklist from spec..."):
-                raw_checklist = extract_spec_checklist(st.session_state.spec_text)
+            with st.spinner("Extracting relevant checklist from spec..."):
+                raw_checklist = extract_spec_checklist(
+                    st.session_state.spec_text,
+                    package_type=st.session_state.classification.get("package_type"),
+                    package_summary=st.session_state.classification.get("summary")
+                )
                 st.session_state.checklist = normalize_checklist(raw_checklist)
-            st.success(f"Found {len(st.session_state.checklist.get('submittals', []))} submittal requirements.")
+            st.success(f"Found {len(st.session_state.checklist.get('submittals', []))} relevant submittal requirements.")
             st.json(st.session_state.checklist)
 
             # Step 3: verify each checklist item (parallel)
@@ -466,8 +651,9 @@ def main():
             total_items = len(checklist_items)
             pkg_type = st.session_state.classification.get("package_type", "Unknown")
 
-            # Create a stable container for the results table
-            results_placeholder = st.empty()
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
             # Initialize ordered findings
             ordered_findings = [
@@ -476,6 +662,7 @@ def main():
             ]
 
             try:
+                completed_count = 0
                 for res in verify_submittal_parallel(
                     st.session_state.checklist, st.session_state.submittal_text, pkg_type, max_workers=4
                 ):
@@ -489,47 +676,59 @@ def main():
                         "evidence": str(res.get("evidence", "")) if isinstance(res, dict) else "",
                     }
                     findings_by_index[int(idx)] = norm
+                    completed_count += 1
+                    
+                    # Update progress
+                    progress = completed_count / total_items
+                    progress_bar.progress(progress)
+                    status_text.text(f"Verified {completed_count}/{total_items} requirements...")
 
-                    # Update ordered findings
-                    ordered_findings = [
-                        findings_by_index.get(i, {"req_id": checklist_items[i].get("id", ""), "status": "PENDING", "evidence": ""})
-                        for i in range(total_items)
-                    ]
-
-                    # Prepare rows for display
-                    rows = []
-                    for i, f in enumerate(ordered_findings):
-                        req_text = checklist_items[i].get("text", checklist_items[i].get("id", ""))
-                        rows.append({
-                            "Requirement": req_text,
-                            "Status": (f.get("status") or "").upper(),
-                            "Evidence": f.get("evidence", ""),
-                        })
-
-                    # Update the display using the stable container
-                    with results_placeholder.container():
-                        _render_rows_with_columns(st, rows)
+                # Clear progress indicators
+                progress_bar.empty()
+                status_text.empty()
                         
             finally:
+                # Create final ordered findings
+                ordered_findings = [
+                    findings_by_index.get(i, {"req_id": checklist_items[i].get("id", ""), "status": "unclear", "evidence": ""})
+                    for i in range(total_items)
+                ]
+                
                 # persist final results once the whole run completes
                 st.session_state.findings = ordered_findings
                 st.session_state.run_analysis = False
                 st.session_state.analysis_done = True
 
         if st.session_state.analysis_done:
-            st.subheader("Results")
+            st.subheader("📊 Verification Results")
+            
+            # Summary metrics
+            total = len(st.session_state.findings)
+            present = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "present")
+            missing = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "missing")
+            not_applicable = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "not_applicable")
+            unclear = total - present - missing - not_applicable
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("✅ Present", present)
+            col2.metric("❌ Missing", missing)
+            col3.metric("⚫ Not Applicable", not_applicable)
+            col4.metric("❓ Unclear", unclear)
+            
+            # Get checklist items for requirement text
+            checklist_items = st.session_state.checklist.get("submittals", [])
+            
             final_rows = []
-            for f in st.session_state.findings:
+            for i, f in enumerate(st.session_state.findings):
+                req_text = checklist_items[i].get("text", f.get("req_id", "")) if i < len(checklist_items) else f.get("req_id", "")
                 final_rows.append({
-                    "Requirement": f.get("req_id", ""),
+                    "Requirement": req_text,
                     "Status": (f.get("status") or "").upper(),
                     "Evidence": f.get("evidence", ""),
                 })
 
-            # Render final results with Streamlit columns to avoid compressed Status column
-            results_container = st.container()
-            _render_rows_with_columns(results_container, final_rows)
-
+            # Render final results
+            _render_rows_with_columns(st, final_rows)
 
 if __name__ == "__main__":
     main()
