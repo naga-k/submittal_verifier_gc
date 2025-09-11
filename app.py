@@ -23,13 +23,13 @@ client = OpenAI(api_key=API_KEY)
 # ---------------------------
 #  UTILS
 # ---------------------------
-def gpt_ocr(image_path: str, model: str = "gpt-4o-mini", detail: str = "low") -> str:
+def gpt_ocr(image_path: str, model: str = "gpt-5-mini", detail: str = "low") -> str:
     """
     OCR an image using OpenAI Vision API.
     
     Args:
         image_path: Path to the image file
-        model: OpenAI model to use (e.g., "gpt-4o-mini")
+        model: OpenAI model to use (e.g., "gpt-5-mini")
         detail: Image detail level ("low", "high")
     
     Returns:
@@ -59,7 +59,7 @@ def gpt_ocr(image_path: str, model: str = "gpt-4o-mini", detail: str = "low") ->
                     ]
                 }
             ],
-            max_tokens=4000
+            max_tokens=16000
         )
         
         return response.choices[0].message.content or ""
@@ -68,10 +68,13 @@ def gpt_ocr(image_path: str, model: str = "gpt-4o-mini", detail: str = "low") ->
         return ""
 
 
-def extract_pdf_with_ocr(uploaded_file, max_workers: int = 4) -> str:
+def extract_text_from_pdf(uploaded_file, use_ocr: bool = True) -> str:
     """
-    Extract text from PDF with OCR fallback for blank pages.
-    Uses PyMuPDF (pymupdf) for both text extraction and rasterization.
+    PDF text extraction with optional OCR fallback.
+    
+    Args:
+        uploaded_file: Streamlit uploaded file
+        use_ocr: If True, use OCR for blank pages. If False, simple extraction only.
     """
     # Save uploaded file to temporary location
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -86,16 +89,19 @@ def extract_pdf_with_ocr(uploaded_file, max_workers: int = 4) -> str:
         blank_pages = []
 
         st.write(f"📄 Analyzing {len(doc)} pages...")
+        
+        # Extract text from all pages
         for i in range(len(doc)):
             page = doc.load_page(i)
             txt = (page.get_text("text") or "").strip()
-            if not txt:
+            if not txt and use_ocr:
                 blank_pages.append(i)
                 page_texts.append("")  # placeholder for OCR
             else:
                 page_texts.append(txt)
 
-        if blank_pages:
+        # OCR processing for blank pages (only if use_ocr=True)
+        if blank_pages and use_ocr:
             st.write(f"🔍 Found {len(blank_pages)} blank pages requiring OCR: {[p+1 for p in blank_pages]}")
             image_paths = []
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -119,12 +125,13 @@ def extract_pdf_with_ocr(uploaded_file, max_workers: int = 4) -> str:
                     def ocr_worker(page_data):
                         idx, img_path = page_data
                         try:
-                            ocr_text = gpt_ocr(img_path, "gpt-4o-mini", "low")
+                            ocr_text = gpt_ocr(img_path, "gpt-5-mini", "low")
                             return idx, ocr_text
                         except Exception as e:
                             st.warning(f"OCR failed for page {idx+1}: {e}")
                             return idx, ""
 
+                    max_workers = 4
                     workers = min(max_workers, max(1, len(image_paths)))
                     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                         progress_bar = st.progress(0)
@@ -140,15 +147,15 @@ def extract_pdf_with_ocr(uploaded_file, max_workers: int = 4) -> str:
                         progress_bar.empty()
                         status_text.empty()
                     st.success(f"✅ OCR completed for {len(image_paths)} pages")
-        else:
+        elif use_ocr:
             st.write("✅ All pages contain extractable text, no OCR needed")
 
-        # 4. Merge results
+        # Merge results
         final_text = "\n\n".join(page_texts)
 
-        # Diagnostics - FIX THE MATH
+        # Diagnostics
         total_chars = len(final_text)
-        if blank_pages:
+        if blank_pages and use_ocr:
             ocr_chars = sum(len(page_texts[i]) for i in blank_pages)
             regular_chars = total_chars - ocr_chars
             st.write(f"📊 Regular pages: {regular_chars:,} chars, OCR pages: {ocr_chars:,} chars")
@@ -168,14 +175,6 @@ def extract_pdf_with_ocr(uploaded_file, max_workers: int = 4) -> str:
             os.unlink(pdf_path)
         except Exception:
             pass
-
-
-def extract_text_from_pdf(uploaded_file) -> str:
-    """
-    Enhanced PDF text extraction with OCR fallback.
-    This replaces the original simple extraction function.
-    """
-    return extract_pdf_with_ocr(uploaded_file, max_workers=4)
 
 
 def ask_llm(prompt: str) -> str:
@@ -610,10 +609,10 @@ def main():
         st.success("✅ Files uploaded")
         if not st.session_state.spec_text:
             with st.spinner("Reading spec..."):
-                st.session_state.spec_text = extract_text_from_pdf(spec_file)
+                st.session_state.spec_text = extract_text_from_pdf(spec_file, use_ocr=False)
         if not st.session_state.submittal_text:
             with st.spinner("Reading submittal..."):
-                st.session_state.submittal_text = extract_text_from_pdf(submittal_file)
+                st.session_state.submittal_text = extract_text_from_pdf(submittal_file, use_ocr=True)
 
         st.subheader("Ready to analyze")
         if st.button("Start LLM Analysis"):
