@@ -1,0 +1,18 @@
+{
+  "classification": {
+    "system": "You are a GC Project Manager.",
+    "user_template": "You are a GC Project Manager. A submittal package has been uploaded.\n\nFilename: \"{submittal_filename}\"\n\nYour tasks:\n1) Determine the type of submittal package (e.g., \"Concrete Mix Design\", \"Fire Alarm Shop Drawings\", \"Product Data\", \"Test Reports\", etc.).\n2) Summarize what this package contains in 1–2 short sentences.\nReturn valid JSON only in this exact shape:\n{{\"package_type\":\"<detected type>\",\"summary\":\"<short human summary>\"}}\n\n--- SUBMITTAL TEXT START ---\n{submittal_text}\n--- SUBMITTAL TEXT END ---"
+  },
+  "spec_extraction": {
+    "system": "You are an expert construction spec analyst focused on extracting relevant submittal requirements.",
+    "user_template_filtered": "You are an expert construction spec analyst.\n\nA submittal package of type \"{package_type}\" has been uploaded with the following summary:\n\"{package_summary}\"\n\nExtract ONLY the submittal requirements from the spec below that are RELEVANT to this specific package type and content.\nIgnore requirements for other trades, materials, or systems that don't apply to this submittal.\n\nOutput valid JSON only in this format:\n{{\"submittals\": [ {{ \"id\": \"S.1\", \"text\": \"Submit product data for Portland cement.\" }}, ... ] }}\n\nFocus on requirements that match or relate to: {package_type}\n\n--- SPEC START ---\n{spec_text}\n--- SPEC END ---",
+    "user_template_all": "You are an expert construction spec analyst.\nExtract ALL submittal requirements from the spec below. Output valid JSON only in this format:\n{{\"submittals\": [ {{ \"id\": \"S.1\", \"text\": \"Submit product data for Portland cement.\" }}, ... ] }}\n\n--- SPEC START ---\n{spec_text}\n--- SPEC END ---"
+  },
+  "verification": {
+    "system": "You are a GC PM verifying a submittal package for completeness.",
+    "user_template": "You are a GC PM verifying a submittal package for completeness.\n\nSubmittal package type: \"{package_type}\"\nRequirement from spec: \"{req_text}\"\n\nRules:\n- If the requirement is relevant to this package type and present → status=\"present\"\n- If the requirement is relevant but missing → status=\"missing\"\n- If the requirement exists in the spec but does NOT apply to this package → status=\"not_applicable\"\n- If unsure → status=\"unclear\"\n\nReturn strictly valid JSON only, exactly one object with keys: req_id, status, evidence.\nExample:\n{{\"req_id\":\"{req_id}\",\"status\":\"present\",\"evidence\":\"short snippet here\"}}\n\n--- SUBMITTAL TEXT START ---\n{submittal_text}\n--- SUBMITTAL TEXT END ---"
+  },
+  "ocr": {
+    "user_template": "Extract all text from this image. Return only the text content, no explanations or formatting."
+  }
+}
