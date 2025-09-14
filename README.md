@@ -1,35 +1,52 @@
 # GC Submittal Completeness Checker (Streamlit MVP)
 
-Single-file Streamlit app to extract submittal requirements from a spec PDF and verify a submittal package using an LLM.
+Lightweight Streamlit app that extracts submittal requirements from a spec and verifies a submittal package using an LLM + OCR pipeline.
 
-## Run locally
+## Quick summary
+- Purpose: classify submittal packages, extract relevant spec requirements, and verify package completeness.
+- Target Python: 3.13 (see `.python-version`)
+- Main files: `app.py` (UI + pipeline), `prompt_manager.py`, `prompts.json`, `pyproject.toml`.
 
-1. Create a Python virtual environment and install deps:
+## Requirements
+- Python 3.13
+- OpenAI API key (Responses + Vision access recommended)
+- uv package manager
 
+## Quickstart (macOS)
+1. Install uv if needed:
 ```zsh
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-2. Add your OpenAI API key to `.streamlit/secrets.toml`:
+2. Install dependencies:
+```zsh
+uv sync
+```
 
+3. Add OpenAI key:
 ```toml
+# .streamlit/secrets.toml
 OPENAI_API_KEY = "sk-..."
 ```
 
-3. Run the app:
-
+4. Run app:
 ```zsh
-streamlit run app.py
+uv run streamlit run app.py
 ```
 
-## Deploy
+## How it works (high level)
+1. Upload spec PDF and submittal package (PDF/image).
+2. Extract text from PDFs (PyMuPDF); blank pages can be OCR'd via OpenAI Vision.
+3. LLM pipeline:
+   - Classify package type & short summary
+   - Extract relevant submittal requirements from spec (JSON checklist)
+   - Verify each requirement against the uploaded package (status + evidence)
 
-- Streamlit Community Cloud: push this repo to GitHub, then connect it on https://share.streamlit.io and add `OPENAI_API_KEY` in the app secrets.
-- Hugging Face Spaces: create a Streamlit space, paste `app.py`, and add `OPENAI_API_KEY` to secrets.
+## Prompts & customization
+- Prompts are in `prompts.json`. Edit to tune system/user instructions, output JSON shapes, or add new agents.
+- `prompt_manager.py` loads and formats prompts.
 
-## Notes
-
-- This is an MVP. The app uses an LLM to parse free-text PDFs — results should be reviewed by a human.
-- Do not commit `.streamlit/secrets.toml` to source control.
+## Troubleshooting
+- "Please add your OpenAI API key" — ensure `.streamlit/secrets.toml` exists and contains `OPENAI_API_KEY`.
+- LLM returns malformed JSON: parser attempts recovery but always review outputs manually.
+- Rate limits: reduce parallel calls (see `verify_submittal_parallel`) or run sequentially.
