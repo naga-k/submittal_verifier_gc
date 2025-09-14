@@ -42,18 +42,7 @@ uv run streamlit run app.py
    - Extract relevant submittal requirements from spec (JSON checklist)
    - Verify each requirement against the uploaded package (status + evidence)
 
-## Prompts & customization
-- Prompts are in `prompts.json`. Edit to tune system/user instructions, output JSON shapes, or add new agents.
-- `prompt_manager.py` loads and formats prompts.
-
-## Troubleshooting
-- "Please add your OpenAI API key" — ensure `.streamlit/secrets.toml` exists and contains `OPENAI_API_KEY`.
-- LLM returns malformed JSON: parser attempts recovery but always review outputs manually.
-- Rate limits: reduce parallel calls (see `verify_submittal_parallel`) or run sequentially.
-
-# Submittal Verifier GC
-
-## Process Flow
+### Process Flow
 
 ```mermaid
 flowchart TD
@@ -91,3 +80,12 @@ flowchart TD
     classDef resultStyle fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px
     classDef outputStyle fill:#fce4ec,stroke:#880e4f,stroke-width:2px
 ```
+
+## Prompts & customization
+- Prompts are in `prompts.json`. Edit to tune system/user instructions, output JSON shapes, or add new agents.
+- `prompt_manager.py` loads and formats prompts.
+
+## Troubleshooting
+- "Please add your OpenAI API key" — ensure `.streamlit/secrets.toml` exists and contains `OPENAI_API_KEY`.
+- LLM returns malformed JSON: parser attempts recovery but always review outputs manually.
+- Rate limits: reduce parallel calls (see `verify_submittal_parallel`) or run sequentially.
