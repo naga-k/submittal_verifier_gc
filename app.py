@@ -8,6 +8,7 @@ import tempfile
 import os
 import base64
 import pymupdf
+from prompt_manager import prompt_manager
 
 # ---------------------------
 #  CONFIG
@@ -39,6 +40,8 @@ def gpt_ocr(image_path: str, model: str = "gpt-5-mini", detail: str = "low") -> 
         with open(image_path, "rb") as image_file:
             base64_image = base64.b64encode(image_file.read()).decode('utf-8')
         
+        ocr_prompt = prompt_manager.get_prompt("ocr")
+        
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -47,7 +50,7 @@ def gpt_ocr(image_path: str, model: str = "gpt-5-mini", detail: str = "low") -> 
                     "content": [
                         {
                             "type": "text",
-                            "text": "Extract all text from this image. Return only the text content, no explanations or formatting."
+                            "text": ocr_prompt
                         },
                         {
                             "type": "image_url",
@@ -348,21 +351,12 @@ def _call_structured(prompt: str, schema_name: str, schema: dict, system_role: s
 #  AGENT: SUBMITTAL PACKAGE CLASSIFIER
 # ---------------------------
 def classify_submittal_package(submittal_text: str, submittal_filename: str):
-    prompt = f"""
-You are a GC Project Manager. A submittal package has been uploaded.
-
-Filename: "{submittal_filename}"
-
-Your tasks:
-1) Determine the type of submittal package (e.g., "Concrete Mix Design", "Fire Alarm Shop Drawings", "Product Data", "Test Reports", etc.).
-2) Summarize what this package contains in 1–2 short sentences.
-Return valid JSON only in this exact shape:
-{{"package_type":"<detected type>","summary":"<short human summary>"}}
-
---- SUBMITTAL TEXT START ---
-{submittal_text}
---- SUBMITTAL TEXT END ---
-"""
+    prompt = prompt_manager.get_prompt(
+        "classification", 
+        submittal_filename=submittal_filename,
+        submittal_text=submittal_text
+    )
+    
     schema = {
         "type": "object",
         "properties": {
@@ -382,41 +376,22 @@ Return valid JSON only in this exact shape:
 #  AGENT: SPEC EXTRACTOR
 # ---------------------------
 def extract_spec_checklist(spec_text: str, package_type: str = None, package_summary: str = None):
-    """
-    Extract submittal requirements from spec, optionally filtered by package type.
-    If package_type is provided, only extract requirements relevant to that type.
-    """
     if package_type and package_summary:
-        prompt = f"""
-You are an expert construction spec analyst.
-
-A submittal package of type "{package_type}" has been uploaded with the following summary:
-"{package_summary}"
-
-Extract ONLY the submittal requirements from the spec below that are RELEVANT to this specific package type and content. 
-Ignore requirements for other trades, materials, or systems that don't apply to this submittal.
-
-Output valid JSON only in this format:
-{{"submittals": [ {{ "id": "S.1", "text": "Submit product data for Portland cement." }}, ... ] }}
-
-Focus on requirements that match or relate to: {package_type}
-
---- SPEC START ---
-{spec_text}
---- SPEC END ---
-"""
+        prompt = prompt_manager.get_prompt(
+            "spec_extraction", 
+            "user_template_filtered",
+            package_type=package_type,
+            package_summary=package_summary,
+            spec_text=spec_text
+        )
     else:
-        # Fallback to original behavior if no package info provided
-        prompt = f"""
-You are an expert construction spec analyst.
-Extract ALL submittal requirements from the spec below. Output valid JSON only in this format:
-{{"submittals": [ {{ "id": "S.1", "text": "Submit product data for Portland cement." }}, ... ] }}
-
---- SPEC START ---
-{spec_text}
---- SPEC END ---
-"""
+        prompt = prompt_manager.get_prompt(
+            "spec_extraction", 
+            "user_template_all",
+            spec_text=spec_text
+        )
     
+    system_prompt = prompt_manager.get_system_prompt("spec_extraction")
     schema = {
         "type": "object",
         "properties": {
@@ -437,7 +412,6 @@ Extract ALL submittal requirements from the spec below. Output valid JSON only i
         "additionalProperties": False
     }
     
-    system_prompt = "You are an expert construction spec analyst focused on extracting relevant submittal requirements."
     parsed = _call_structured(prompt, "spec_checklist", schema, system_prompt)
     return normalize_checklist(parsed)
 
