@@ -226,20 +226,18 @@ def main():
                 total = len(final_state.findings)
                 present = sum(1 for f in final_state.findings if f.status == "present")
                 missing = sum(1 for f in final_state.findings if f.status == "missing")
-                not_applicable = sum(1 for f in final_state.findings if f.status == "not_applicable")
-                unclear = total - present - missing - not_applicable
+                unclear = sum(1 for f in final_state.findings if f.status == "unclear")
                 
-                # Enhanced metrics with percentages
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("✅ Present", present, delta=f"{present/total*100:.1f}%" if total > 0 else "0%")
-                col2.metric("❌ Missing", missing, delta=f"{missing/total*100:.1f}%" if total > 0 else "0%")
-                col3.metric("⚫ Not Applicable", not_applicable, delta=f"{not_applicable/total*100:.1f}%" if total > 0 else "0%")
-                col4.metric("❓ Unclear", unclear, delta=f"{unclear/total*100:.1f}%" if total > 0 else "0%")
+                # Enhanced metrics
+                col1, col2, col3 = st.columns(3)
+                col1.metric("✅ Present", present)
+                col2.metric("❌ Missing", missing)
+                col3.metric("❓ Unclear", unclear)
                 
                 # Completion percentage
-                completion_rate = (present / (present + missing)) * 100 if (present + missing) > 0 else 0
+                completion_rate = (present / (present + missing + unclear)) * 100 if (present + missing + unclear) > 0 else 0
                 st.metric("📈 Completion Rate", f"{completion_rate:.1f}%", 
-                         help="Percentage of applicable requirements that are present")
+                         help="Percentage of requirements that are present")
                 
                 # Progress bar for completion
                 st.progress(completion_rate / 100)
@@ -250,7 +248,7 @@ def main():
                 # Filter options
                 status_filter = st.selectbox(
                     "Filter by status:", 
-                    ["All", "Present", "Missing", "Not Applicable", "Unclear"]
+                    ["All", "Present", "Missing", "Unclear"]
                 )
                 
                 # Prepare rows for display
@@ -267,7 +265,6 @@ def main():
                     status_map = {
                         "present": "✅ PRESENT",
                         "missing": "❌ MISSING", 
-                        "not_applicable": "⚫ NOT APPLICABLE",
                         "unclear": "❓ UNCLEAR"
                     }
                     

@@ -177,7 +177,7 @@ def verify_requirements_node(state: RunState) -> Dict[str, Any]:
                 "type": "object",
                 "properties": {
                     "req_id": {"type": "string"},
-                    "status": {"type": "string", "enum": ["present", "missing", "not_applicable", "unclear"]},
+                    "status": {"type": "string", "enum": ["present", "missing", "unclear"]},
                     "evidence": {"type": "string"}
                 },
                 "required": ["req_id", "status", "evidence"],

@@ -10,7 +10,7 @@
   },
   "verification": {
     "system": "You are a GC PM verifying a submittal package for completeness.",
-    "user_template": "You are a GC PM verifying a submittal package for completeness.\n\nSubmittal package type: \"{package_type}\"\nRequirement from spec: \"{req_text}\"\n\nRules:\n- If the requirement is relevant to this package type and present → status=\"present\"\n- If the requirement is relevant but missing → status=\"missing\"\n- If the requirement exists in the spec but does NOT apply to this package → status=\"not_applicable\"\n- If unsure → status=\"unclear\"\n\nReturn strictly valid JSON only, exactly one object with keys: req_id, status, evidence.\nExample:\n{{\"req_id\":\"{req_id}\",\"status\":\"present\",\"evidence\":\"short snippet here\"}}\n\n--- SUBMITTAL TEXT START ---\n{submittal_text}\n--- SUBMITTAL TEXT END ---"
+    "user_template": "You are a GC PM verifying a submittal package for completeness.\n\nSubmittal package type: \"{package_type}\"\nRequirement from spec: \"{req_text}\"\n\nRules:\n- If the requirement is present and satisfied → status=\"present\"\n- If the requirement is missing or not satisfied → status=\"missing\"\n- If unsure or cannot determine → status=\"unclear\"\n\nReturn strictly valid JSON only, exactly one object with keys: req_id, status, evidence.\nExample:\n{{\"req_id\":\"{req_id}\",\"status\":\"present\",\"evidence\":\"short snippet here\"}}\n\n--- SUBMITTAL TEXT START ---\n{submittal_text}\n--- SUBMITTAL TEXT END ---"
   },
   "ocr": {
     "user_template": "Extract all text from this image. Return only the text content, no explanations or formatting."

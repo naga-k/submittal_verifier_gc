@@ -14,7 +14,7 @@ class Checklist(BaseModel):
 
 class Finding(BaseModel):
     req_id: str
-    status: str  # present | missing | not_applicable | unclear
+    status: str  # present | missing | unclear
     evidence: str = ""
 
 class RunState(BaseModel):
