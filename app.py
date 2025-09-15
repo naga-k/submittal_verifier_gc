@@ -6,14 +6,15 @@ from extraction.pdf import extract_text_from_pdf
 import time
 import threading
 import queue
+import os
 
 # ---------------------------
 #  CONFIG
 # ---------------------------
 st.set_page_config(page_title="GC Submittal Completeness Checker", layout="wide")
-API_KEY = st.secrets.get("OPENAI_API_KEY")
+API_KEY = st.secrets.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
 if not API_KEY:
-    st.error('Please add your OpenAI API key to .streamlit/secrets.toml as OPENAI_API_KEY')
+    st.error('Please set OPENAI_API_KEY in .streamlit/secrets.toml or as an environment variable')
     st.stop()
 client = OpenAI(api_key=API_KEY)
 
