@@ -5,7 +5,7 @@ Lightweight Streamlit app that extracts submittal requirements from a spec and v
 ## Quick summary
 - Purpose: classify submittal packages, extract relevant spec requirements, and verify package completeness.
 - Target Python: 3.13 (see `.python-version`)
-- Main files: `app.py` (UI + pipeline), `prompt_manager.py`, `prompts.json`, `pyproject.toml`.
+- Main files: `app.py` (UI + pipeline), `prompts/manager.py`, `prompts/prompts.json`, `pyproject.toml`.
 
 ## Requirements
 - Python 3.13
@@ -82,8 +82,8 @@ flowchart TD
 ```
 
 ## Prompts & customization
-- Prompts are in `prompts.json`. Edit to tune system/user instructions, output JSON shapes, or add new agents.
-- `prompt_manager.py` loads and formats prompts.
+- Prompts are in `prompts/prompts/prompts.json`. Edit to tune system/user instructions, output JSON shapes, or add new agents.
+- `prompts/manager.py` loads and formats prompts.
 
 ## Troubleshooting
 - "Please add your OpenAI API key" — ensure `.streamlit/secrets.toml` exists and contains `OPENAI_API_KEY`.

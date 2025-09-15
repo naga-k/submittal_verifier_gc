@@ -1,14 +1,11 @@
-import re
 import streamlit as st
 from openai import OpenAI
-import json
+from graph.workflow import build_workflow
+from graph.schemas import RunState
+from extraction.pdf import extract_text_from_pdf
 import time
-import concurrent.futures
-import tempfile
-import os
-import base64
-import pymupdf
-from prompt_manager import prompt_manager
+import threading
+import queue
 
 # ---------------------------
 #  CONFIG
@@ -22,244 +19,10 @@ client = OpenAI(api_key=API_KEY)
 
 
 # ---------------------------
-#  UTILS
-# ---------------------------
-def gpt_ocr(image_path: str, model: str = "gpt-5-mini", detail: str = "low") -> str:
-    """
-    OCR an image using OpenAI Vision API.
-    
-    Args:
-        image_path: Path to the image file
-        model: OpenAI model to use (e.g., "gpt-5-mini")
-        detail: Image detail level ("low", "high")
-    
-    Returns:
-        Extracted text from the image
-    """
-    try:
-        with open(image_path, "rb") as image_file:
-            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-        
-        ocr_prompt = prompt_manager.get_prompt("ocr")
-        
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": ocr_prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{base64_image}",
-                                "detail": detail
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=16000
-        )
-        
-        return response.choices[0].message.content or ""
-    except Exception as e:
-        st.warning(f"OCR failed for {image_path}: {str(e)}")
-        return ""
-
-
-def extract_text_from_pdf(uploaded_file, use_ocr: bool = True) -> str:
-    """
-    PDF text extraction with optional OCR fallback.
-    
-    Args:
-        uploaded_file: Streamlit uploaded file
-        use_ocr: If True, use OCR for blank pages. If False, simple extraction only.
-    """
-    # Save uploaded file to temporary location
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        pdf_path = tmp_file.name
-
-    doc = None
-    try:
-        # Open with PyMuPDF
-        doc = pymupdf.open(pdf_path)
-        page_texts = []
-        blank_pages = []
-
-        st.write(f"📄 Analyzing {len(doc)} pages...")
-        
-        # Extract text from all pages
-        for i in range(len(doc)):
-            page = doc.load_page(i)
-            txt = (page.get_text("text") or "").strip()
-            if not txt and use_ocr:
-                blank_pages.append(i)
-                page_texts.append("")  # placeholder for OCR
-            else:
-                page_texts.append(txt)
-
-        # OCR processing for blank pages (only if use_ocr=True)
-        if blank_pages and use_ocr:
-            st.write(f"🔍 Found {len(blank_pages)} blank pages requiring OCR: {[p+1 for p in blank_pages]}")
-            image_paths = []
-            with tempfile.TemporaryDirectory() as temp_dir:
-                for i in blank_pages:
-                    try:
-                        page = doc.load_page(i)
-                        pix = page.get_pixmap(dpi=200)
-                        img_path = os.path.join(temp_dir, f"page_{i+1}.png")
-                        pix.save(img_path)
-                        image_paths.append((i, img_path))
-                    except Exception as e:
-                        st.warning(f"Failed to convert page {i+1} to image: {e}")
-
-                # close doc after images are created
-                doc.close()
-                doc = None
-
-                if image_paths:
-                    st.write(f"🤖 Running OCR on {len(image_paths)} pages...")
-
-                    def ocr_worker(page_data):
-                        idx, img_path = page_data
-                        try:
-                            ocr_text = gpt_ocr(img_path, "gpt-5-mini", "low")
-                            return idx, ocr_text
-                        except Exception as e:
-                            st.warning(f"OCR failed for page {idx+1}: {e}")
-                            return idx, ""
-
-                    max_workers = 4
-                    workers = min(max_workers, max(1, len(image_paths)))
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        futures = [executor.submit(ocr_worker, pd) for pd in image_paths]
-                        completed = 0
-                        for fut in concurrent.futures.as_completed(futures):
-                            idx, ocr_txt = fut.result()
-                            page_texts[idx] = ocr_txt
-                            completed += 1
-                            progress_bar.progress(completed / len(image_paths))
-                            status_text.text(f"OCR completed: {completed}/{len(image_paths)} pages")
-                        progress_bar.empty()
-                        status_text.empty()
-                    st.success(f"✅ OCR completed for {len(image_paths)} pages")
-        elif use_ocr:
-            st.write("✅ All pages contain extractable text, no OCR needed")
-
-        # Merge results
-        final_text = "\n\n".join(page_texts)
-
-        # Diagnostics
-        total_chars = len(final_text)
-        if blank_pages and use_ocr:
-            ocr_chars = sum(len(page_texts[i]) for i in blank_pages)
-            regular_chars = total_chars - ocr_chars
-            st.write(f"📊 Regular pages: {regular_chars:,} chars, OCR pages: {ocr_chars:,} chars")
-            st.write(f"📊 OCR added {ocr_chars:,} characters from {len(blank_pages)} pages")
-        st.write(f"📄 Total text extracted: {total_chars:,} characters")
-
-        return final_text
-
-    finally:
-        # ensure document closed and temp pdf removed
-        try:
-            if doc is not None:
-                doc.close()
-        except Exception:
-            pass
-        try:
-            os.unlink(pdf_path)
-        except Exception:
-            pass
-
-
-def ask_llm(prompt: str) -> str:
-    """
-    Uses OpenAI Responses API (gpt-5-mini). Returns best-effort plain text.
-    """
-    resp = client.responses.create(
-        model="gpt-5-mini",
-        input=[
-            {"role": "system", "content": "You are a construction workflow assistant and GC project manager."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-
-    # Preferred convenience property
-    if hasattr(resp, "output_text") and resp.output_text:
-        return resp.output_text
-
-    # Fallback: walk output pieces
-    try:
-        pieces = []
-        for out in getattr(resp, "output", []):
-            for item in out.get("content", []):
-                if item.get("type") == "output_text":
-                    pieces.append(item.get("text", ""))
-        return "\n".join(pieces)
-    except Exception:
-        return ""
-
-
-def parse_llm_json(text: str):
-    """
-    Robust JSON extraction from LLM text. Returns dict/list/None.
-    """
-    if not text:
-        return None
-    # Try direct JSON
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Try to extract first JSON object/array in text
-    m = re.search(r"(\{.*\}|\[.*\])", text, flags=re.S)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
-
-
-def normalize_checklist(obj):
-    """
-    Ensure checklist is dict with 'submittals' list of dicts with id/text.
-    """
-    if not obj:
-        return {"submittals": []}
-    if isinstance(obj, dict) and "submittals" in obj and isinstance(obj["submittals"], list):
-        subs = obj["submittals"]
-    elif isinstance(obj, list) and all(isinstance(x, dict) for x in obj):
-        subs = obj
-    else:
-        return {"submittals": []}
-
-    out = []
-    for i, item in enumerate(subs, start=1):
-        if not isinstance(item, dict):
-            continue
-        entry = {"id": item.get("id", f"S.{i}"), "text": item.get("text", "").strip()}
-        out.append(entry)
-    return {"submittals": out}
-
-
-# ---------------------------
-# UI RENDER HELPERS (moved to top-level)
+# UI RENDER HELPERS
 # ---------------------------
 def _render_rows_with_columns(container, rows, col_widths=(3, 1, 6)):
-    """
-    Render header + rows using Streamlit columns. Use consistent column widths
-    so layout doesn't collapse when called repeatedly.
-    """
+    """Render header + rows using Streamlit columns."""
     hdr_req, hdr_status, hdr_ev = container.columns(list(col_widths))
     hdr_req.markdown("**Requirement**")
     hdr_status.markdown("**Status**")
@@ -270,287 +33,12 @@ def _render_rows_with_columns(container, rows, col_widths=(3, 1, 6)):
         c_status.markdown(f"**{r.get('Status','')}**")
         c_ev.write(r.get("Evidence", ""))
 
-
-def _call_structured(prompt: str, schema_name: str, schema: dict, system_role: str):
-    """
-    Use Responses API Structured Outputs via the `text.format` param (json_schema).
-    Prefer resp.output_parsed when available. Fall back to older clients by removing
-    the `text` param and parsing output_text / raw pieces.
-    Uses model "gpt-5-mini" (supports structured outputs).
-    """
-    payload = {
-        "model": "gpt-5-mini",
-        "input": [
-            {"role": "system", "content": system_role},
-            {"role": "user", "content": prompt},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": schema_name,
-                "schema": schema,
-                "strict": True,
-            }
-        },
-    }
-
-    try:
-        resp = client.responses.create(**payload)
-    except TypeError:
-        # older SDK doesn't accept `text` structured param -> fallback to plain call
-        fallback = {
-            "model": payload["model"],
-            "input": payload["input"],
-        }
-        resp = client.responses.create(**fallback)
-
-    # If the SDK parsed structured output for us, return it
-    parsed = getattr(resp, "output_parsed", None)
-    if parsed is not None:
-        return parsed
-
-    # Handle incomplete/refusal cases quickly
-    if getattr(resp, "status", None) == "incomplete":
-        try:
-            if getattr(resp, "incomplete_details", {}).get("reason") == "max_output_tokens":
-                return None
-        except Exception:
-            pass
-
-    # Fallbacks: prefer output_text then harvest raw pieces and try to parse JSON
-    text = getattr(resp, "output_text", None)
-    if text:
-        try:
-            return json.loads(text)
-        except Exception:
-            frag = parse_llm_json(text)
-            if frag is not None:
-                return frag
-
-    try:
-        pieces = []
-        for out in getattr(resp, "output", []) or []:
-            for item in out.get("content", []):
-                if item.get("type") == "output_text":
-                    pieces.append(item.get("text", ""))
-                elif item.get("type") == "refusal":
-                    return {"_refusal": item.get("refusal")}
-        joined = "\n".join(pieces)
-        if joined:
-            try:
-                return json.loads(joined)
-            except Exception:
-                return parse_llm_json(joined)
-    except Exception:
-        pass
-
-    return None
-
-
-# ---------------------------
-#  AGENT: SUBMITTAL PACKAGE CLASSIFIER
-# ---------------------------
-def classify_submittal_package(submittal_text: str, submittal_filename: str):
-    prompt = prompt_manager.get_prompt(
-        "classification", 
-        submittal_filename=submittal_filename,
-        submittal_text=submittal_text
-    )
-    
-    schema = {
-        "type": "object",
-        "properties": {
-            "package_type": {"type": "string"},
-            "summary": {"type": "string"}
-        },
-        "required": ["package_type", "summary"],
-        "additionalProperties": False
-    }
-    parsed = _call_structured(prompt, "classification", schema, "You are a GC Project Manager.")
-    if isinstance(parsed, dict) and parsed.get("package_type"):
-        return {"package_type": str(parsed.get("package_type")), "summary": str(parsed.get("summary", ""))}
-    return {"package_type": "Unknown", "summary": "Could not determine the type of submittal package."}
-
-
-# ---------------------------
-#  AGENT: SPEC EXTRACTOR
-# ---------------------------
-def extract_spec_checklist(spec_text: str, package_type: str = None, package_summary: str = None):
-    if package_type and package_summary:
-        prompt = prompt_manager.get_prompt(
-            "spec_extraction", 
-            "user_template_filtered",
-            package_type=package_type,
-            package_summary=package_summary,
-            spec_text=spec_text
-        )
-    else:
-        prompt = prompt_manager.get_prompt(
-            "spec_extraction", 
-            "user_template_all",
-            spec_text=spec_text
-        )
-    
-    system_prompt = prompt_manager.get_system_prompt("spec_extraction")
-    schema = {
-        "type": "object",
-        "properties": {
-            "submittals": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "text": {"type": "string"}
-                    },
-                    "required": ["id", "text"],
-                    "additionalProperties": False
-                }
-            }
-        },
-        "required": ["submittals"],
-        "additionalProperties": False
-    }
-    
-    parsed = _call_structured(prompt, "spec_checklist", schema, system_prompt)
-    return normalize_checklist(parsed)
-
-
-# ---------------------------
-#  AGENT: PACKAGE VERIFIER
-# ---------------------------
-def verify_submittal(checklist: dict, submittal_text: str, package_type: str):
-    find_schema = {
-        "type": "object",
-        "properties": {
-            "req_id": {"type": "string"},
-            "status": {"type": "string", "enum": ["present", "missing", "not_applicable", "unclear"]},
-            "evidence": {"type": "string"}
-        },
-        "required": ["req_id", "status"]
-    }
-
-    for item in checklist.get("submittals", []):
-        req_id = item.get("id")
-        req_text = item.get("text", "")
-        prompt = f"""
-You are a GC PM verifying a submittal package for completeness.
-
-Submittal package type: "{package_type}"
-Requirement from spec: "{req_text}"
-
-Rules:
-- If the requirement is relevant to this package type and present → status="present"
-- If the requirement is relevant but missing → status="missing"
-- If the requirement exists in the spec but does NOT apply to this package → status="not_applicable"
-- If unsure → status="unclear"
-
-Return strictly valid JSON only, exactly one object with keys: req_id, status, evidence.
-Example:
-{{"req_id":"{req_id}","status":"present","evidence":"short snippet here"}}
-
---- SUBMITTAL TEXT START ---
-{submittal_text}
---- SUBMITTAL TEXT END ---
-"""
-        parsed = _call_structured(prompt, "verification", find_schema, "You are a GC PM verifying a submittal package for completeness.")
-        finding = None
-        if isinstance(parsed, dict):
-            finding = parsed
-        elif isinstance(parsed, list) and parsed:
-            first = parsed[0]
-            if isinstance(first, dict):
-                finding = first
-        if not isinstance(finding, dict):
-            finding = {"req_id": req_id, "status": "unclear", "evidence": ""}
-        finding.setdefault("req_id", req_id)
-        finding.setdefault("status", "unclear")
-        finding.setdefault("evidence", "")
-        yield {"req_id": str(finding["req_id"]), "status": str(finding["status"]), "evidence": str(finding["evidence"])}
-        time.sleep(0.12)
-
-
-def verify_submittal_parallel(checklist: dict, submittal_text: str, package_type: str, max_workers: int = 4):
-    """
-    Parallelized verification of checklist items using a ThreadPoolExecutor.
-    Yields normalized finding dicts as each LLM call completes.
-    Each result includes 'index' to allow ordered rendering.
-    Note: keep max_workers modest (2-6) to avoid rate limits.
-    """
-    items = checklist.get("submittals", []) or []
-
-    def worker(item, index):
-        req_id = item.get("id")
-        req_text = item.get("text", "")
-        prompt = f"""
-You are a GC PM verifying a submittal package for completeness.
-
-Submittal package type: "{package_type}"
-Requirement from spec: "{req_text}"
-
-Rules:
-- If the requirement is relevant to this package type and present → status="present"
-- If the requirement is relevant but missing → status="missing"
-- If the requirement exists in the spec but does NOT apply to this package → status="not_applicable"
-- If unsure → status="unclear"
-
-Return strictly valid JSON only, exactly one object with keys: req_id, status, evidence.
-Example:
-{{"req_id":"{req_id}","status":"present","evidence":"short snippet here"}}
-
---- SUBMITTAL TEXT START ---
-{submittal_text}
---- SUBMITTAL TEXT END ---
-"""
-        find_schema = {
-            "type": "object",
-            "properties": {
-                "req_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["present", "missing", "not_applicable", "unclear"]},
-                "evidence": {"type": "string"}
-            },
-            "required": ["req_id", "status", "evidence"],
-            "additionalProperties": False
-        }
-
-        try:
-            parsed = _call_structured(prompt, "verification", find_schema, "You are a GC PM verifying a submittal package for completeness.")
-            # handle refusal
-            if isinstance(parsed, dict) and parsed.get("_refusal"):
-                return {"index": index, "req_id": req_id, "status": "unclear", "evidence": f"refusal: {parsed.get('_refusal')}"}
-
-            finding = None
-            if isinstance(parsed, dict):
-                finding = parsed
-            elif isinstance(parsed, list) and parsed:
-                first = parsed[0]
-                if isinstance(first, dict):
-                    finding = first
-
-            if not isinstance(finding, dict):
-                finding = {"req_id": req_id, "status": "unclear", "evidence": ""}
-
-            finding.setdefault("req_id", req_id)
-            finding.setdefault("status", "unclear")
-            finding.setdefault("evidence", "")
-
-            return {"index": index, "req_id": str(finding["req_id"]), "status": str(finding["status"]), "evidence": str(finding["evidence"])}
-        except Exception:
-            return {"index": index, "req_id": req_id, "status": "unclear", "evidence": ""}
-
-    workers = min(max_workers, max(1, len(items)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(worker, itm, idx) for idx, itm in enumerate(items)]
-        for fut in concurrent.futures.as_completed(futures):
-            yield fut.result()
-
-
 # ---------------------------
 #  STREAMLIT UI
 # ---------------------------
 def main():
     st.title("📄 GC Submittal Completeness Checker")
-    st.write("Upload a spec PDF and a submittal PDF. Click 'Start LLM Analysis' to run the pipeline.")
+    st.write("Upload a spec PDF and a submittal PDF to verify completeness against project requirements.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -558,150 +46,241 @@ def main():
     with col2:
         submittal_file = st.file_uploader("Upload Submittal PDF", type=["pdf"])
 
-    # persistent state
-    st.session_state.setdefault("uploaded_names", (None, None))
-    st.session_state.setdefault("spec_text", None)
-    st.session_state.setdefault("submittal_text", None)
-    st.session_state.setdefault("classification", None)
-    st.session_state.setdefault("checklist", None)
-    st.session_state.setdefault("findings", [])
-    st.session_state.setdefault("run_analysis", False)
-    st.session_state.setdefault("analysis_done", False)
-
     if spec_file and submittal_file:
-        uploaded = (spec_file.name, submittal_file.name)
-        if st.session_state.uploaded_names != uploaded:
-            st.session_state.uploaded_names = uploaded
-            st.session_state.spec_text = None
-            st.session_state.submittal_text = None
-            st.session_state.classification = None
-            st.session_state.checklist = None
-            st.session_state.findings = []
-            st.session_state.run_analysis = False
-            st.session_state.analysis_done = False
-
-        st.success("✅ Files uploaded")
-        if not st.session_state.spec_text:
-            with st.spinner("Reading spec..."):
-                st.session_state.spec_text = extract_text_from_pdf(spec_file, use_ocr=False)
-        if not st.session_state.submittal_text:
-            with st.spinner("Reading submittal..."):
-                st.session_state.submittal_text = extract_text_from_pdf(submittal_file, use_ocr=True)
-
-        st.subheader("Ready to analyze")
-        if st.button("Start LLM Analysis"):
-            st.session_state.findings = []
-            st.session_state.run_analysis = True
-            st.session_state.analysis_done = False
-
-        if st.session_state.run_analysis and not st.session_state.analysis_done:
-            # Step 1: classify package
-            with st.spinner("Classifying submittal package..."):
-                st.session_state.classification = classify_submittal_package(
-                    st.session_state.submittal_text, submittal_file.name
-                )
-
-            st.subheader("📦 Submittal Package Summary")
-            st.write("**Type:**", st.session_state.classification.get("package_type", "Unknown"))
-            st.write("**Summary:**", st.session_state.classification.get("summary", ""))
-
-            # Step 2: extract checklist
-            with st.spinner("Extracting relevant checklist from spec..."):
-                raw_checklist = extract_spec_checklist(
-                    st.session_state.spec_text,
-                    package_type=st.session_state.classification.get("package_type"),
-                    package_summary=st.session_state.classification.get("summary")
-                )
-                st.session_state.checklist = normalize_checklist(raw_checklist)
-            st.success(f"Found {len(st.session_state.checklist.get('submittals', []))} relevant submittal requirements.")
-            st.json(st.session_state.checklist)
-
-            # Step 3: verify each checklist item (parallel)
-            st.subheader("Verifying completeness")
+        st.success("✅ Files uploaded successfully")
+        
+        if st.button("Start Analysis"):
+            # Create progress tracking containers
+            progress_container = st.container()
             
-            checklist_items = st.session_state.checklist.get("submittals", [])
-            findings_by_index = {}
-            total_items = len(checklist_items)
-            pkg_type = st.session_state.classification.get("package_type", "Unknown")
-
-            # Progress tracking
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # Initialize ordered findings
-            ordered_findings = [
-                {"req_id": checklist_items[i].get("id", ""), "status": "PENDING", "evidence": ""}
-                for i in range(total_items)
-            ]
-
-            try:
-                completed_count = 0
-                for res in verify_submittal_parallel(
-                    st.session_state.checklist, st.session_state.submittal_text, pkg_type, max_workers=4
-                ):
-                    idx = res.get("index") if isinstance(res, dict) else None
-                    if idx is None:
-                        idx = len(findings_by_index)
-                    
-                    norm = {
-                        "req_id": str(res.get("req_id", "")) if isinstance(res, dict) else str(res),
-                        "status": str(res.get("status", "unclear")) if isinstance(res, dict) else "unclear",
-                        "evidence": str(res.get("evidence", "")) if isinstance(res, dict) else "",
-                    }
-                    findings_by_index[int(idx)] = norm
-                    completed_count += 1
-                    
-                    # Update progress
-                    progress = completed_count / total_items
-                    progress_bar.progress(progress)
-                    status_text.text(f"Verified {completed_count}/{total_items} requirements...")
-
-                # Clear progress indicators
-                progress_bar.empty()
-                status_text.empty()
-                        
-            finally:
-                # Create final ordered findings
-                ordered_findings = [
-                    findings_by_index.get(i, {"req_id": checklist_items[i].get("id", ""), "status": "unclear", "evidence": ""})
-                    for i in range(total_items)
-                ]
+            with progress_container:
+                st.subheader("📊 Analysis Progress")
                 
-                # persist final results once the whole run completes
-                st.session_state.findings = ordered_findings
-                st.session_state.run_analysis = False
-                st.session_state.analysis_done = True
-
-        if st.session_state.analysis_done:
-            st.subheader("📊 Verification Results")
+                # Step 1: Document Processing
+                with st.expander("📄 Step 1: Document Processing", expanded=True):
+                    spec_col, sub_col = st.columns(2)
+                    
+                    with spec_col:
+                        st.write("**Processing Spec PDF...**")
+                        with st.spinner("Extracting spec text..."):
+                            spec_text = extract_text_from_pdf(spec_file, use_ocr=False)
+                        st.success(f"✅ Extracted {len(spec_text):,} characters")
+                    
+                    with sub_col:
+                        st.write("**Processing Submittal PDF...**")
+                        with st.spinner("Extracting submittal text (with OCR)..."):
+                            submittal_text = extract_text_from_pdf(submittal_file, use_ocr=True)
+                        st.success(f"✅ Extracted {len(submittal_text):,} characters")
+                
+                # Step 2: Analysis
+                with st.expander("🤖 Step 2: Analysis", expanded=True):
+                    st.write("**Running workflow...**")
+                    
+                    # Build workflow
+                    workflow = build_workflow()
+                    
+                    # Create initial state
+                    initial_state = RunState(
+                        spec_pdf_name=spec_file.name,
+                        submittal_pdf_name=submittal_file.name,
+                        spec_text=spec_text,
+                        submittal_text=submittal_text
+                    )
+                    
+                    # Show estimated time
+                    st.info("🕐 This typically takes 2-5 minutes depending on document complexity")
+                    
+                    # Run the workflow with progress indication
+                    try:
+                        # Add a progress bar that fills over time (estimated)
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        # Start analysis
+                        start_time = time.time()
+                        
+                        # Use threading to show progress while LangGraph runs
+                        result_queue = queue.Queue()
+                        
+                        def run_workflow():
+                            try:
+                                print("🚀 [DEBUG] Starting workflow execution...")
+                                result = workflow.invoke(initial_state)
+                                print(f"🎯 [DEBUG] Workflow completed. Result type: {type(result)}")
+                                print(f"🔑 [DEBUG] Result keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+                                
+                                # LangGraph returns a dict, not a Pydantic object
+                                if isinstance(result, dict):
+                                    if "error_message" in result and result["error_message"]:
+                                        print(f"❌ [DEBUG] Workflow returned error: {result['error_message']}")
+                                        result_queue.put(("error", result["error_message"]))
+                                        return
+                                    
+                                    # Convert dict back to RunState object for consistency
+                                    final_state = RunState(**result)
+                                    print(f"✅ [DEBUG] Converted to RunState. Has findings: {len(final_state.findings) if final_state.findings else 0}")
+                                    result_queue.put(("success", final_state))
+                                else:
+                                    print(f"⚠️ [DEBUG] Unexpected result type: {type(result)}")
+                                    result_queue.put(("success", result))
+                                
+                                print("✅ [DEBUG] Result successfully queued")
+                            except Exception as e:
+                                print(f"❌ [DEBUG] Workflow failed with error: {str(e)}")
+                                import traceback
+                                traceback.print_exc()
+                                result_queue.put(("error", str(e)))
+                        
+                        # Start workflow in background
+                        print("🚀 [DEBUG] Starting workflow thread...")
+                        thread = threading.Thread(target=run_workflow)
+                        thread.start()
+                        print("🚀 [DEBUG] Thread started")
+                        
+                        # Simulate progress while waiting
+                        progress = 0.0
+                        messages = [
+                            "🔍 Classifying submittal package...",
+                            "📋 Extracting requirements from spec...", 
+                            "✅ Verifying requirements completeness...",
+                            "🔄 Finalizing analysis..."
+                        ]
+                        
+                        result_type = None
+                        result_data = None
+                        
+                        while thread.is_alive():
+                            message_idx = int(progress * len(messages))
+                            if message_idx >= len(messages):
+                                message_idx = len(messages) - 1
+                            
+                            status_text.text(messages[message_idx])
+                            progress_bar.progress(min(progress, 0.95))
+                            
+                            time.sleep(0.5)
+                            progress += 0.05
+                            
+                            # Check if workflow completed
+                            try:
+                                result_type, result_data = result_queue.get_nowait()
+                                print(f"🎯 [DEBUG] Got result from queue during progress: {result_type}")
+                                break
+                            except queue.Empty:
+                                continue
+                        
+                        # Wait for thread to complete
+                        print("⏳ [DEBUG] Waiting for thread to join...")
+                        thread.join()
+                        print(f"🏁 [DEBUG] Thread joined. Thread alive: {thread.is_alive()}")
+                        
+                        # Get final result if not already retrieved during progress
+                        if result_type is None:
+                            print("🔍 [DEBUG] No result retrieved during progress, getting from queue...")
+                            try:
+                                result_type, result_data = result_queue.get_nowait()
+                                print(f"🎯 [DEBUG] Got result after join: {result_type}")
+                            except queue.Empty:
+                                print("❌ [DEBUG] Queue is empty after thread completion!")
+                                result_type, result_data = "error", "Workflow completed but no result was returned"
+                        else:
+                            print(f"✅ [DEBUG] Already have result from progress loop: {result_type}")
+                        
+                        # Complete progress
+                        progress_bar.progress(1.0)
+                        status_text.text("✨ Analysis complete!")
+                        
+                        print(f"🎯 [DEBUG] Final result type: {result_type}")
+                        if result_type == "error":
+                            print(f"❌ [DEBUG] Raising exception: {result_data}")
+                            raise Exception(result_data)
+                        
+                        final_state = result_data
+                        elapsed = time.time() - start_time
+                        st.success(f"✅ Analysis completed in {elapsed:.1f} seconds")
+                        print(f"🎉 [DEBUG] Analysis completed successfully in {elapsed:.1f} seconds")
+                        
+                    except Exception as e:
+                        st.error(f"Analysis failed: {str(e)}")
+                        return
+            
+            # Clear progress container and show results
+            progress_container.empty()
+            
+            if final_state.error_message:
+                st.error(f"Analysis failed: {final_state.error_message}")
+                return
+            
+            # Display results
+            st.subheader("📦 Submittal Package Summary")
+            if final_state.classification:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Package Type", final_state.classification.package_type)
+                with col2:
+                    st.write("**Summary:**", final_state.classification.summary)
             
             # Summary metrics
-            total = len(st.session_state.findings)
-            present = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "present")
-            missing = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "missing")
-            not_applicable = sum(1 for f in st.session_state.findings if f.get("status", "").lower() == "not_applicable")
-            unclear = total - present - missing - not_applicable
-            
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("✅ Present", present)
-            col2.metric("❌ Missing", missing)
-            col3.metric("⚫ Not Applicable", not_applicable)
-            col4.metric("❓ Unclear", unclear)
-            
-            # Get checklist items for requirement text
-            checklist_items = st.session_state.checklist.get("submittals", [])
-            
-            final_rows = []
-            for i, f in enumerate(st.session_state.findings):
-                req_text = checklist_items[i].get("text", f.get("req_id", "")) if i < len(checklist_items) else f.get("req_id", "")
-                final_rows.append({
-                    "Requirement": req_text,
-                    "Status": (f.get("status") or "").upper(),
-                    "Evidence": f.get("evidence", ""),
-                })
-
-            # Render final results
-            _render_rows_with_columns(st, final_rows)
+            if final_state.findings:
+                st.subheader("📊 Verification Results")
+                
+                total = len(final_state.findings)
+                present = sum(1 for f in final_state.findings if f.status == "present")
+                missing = sum(1 for f in final_state.findings if f.status == "missing")
+                not_applicable = sum(1 for f in final_state.findings if f.status == "not_applicable")
+                unclear = total - present - missing - not_applicable
+                
+                # Enhanced metrics with percentages
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("✅ Present", present, delta=f"{present/total*100:.1f}%" if total > 0 else "0%")
+                col2.metric("❌ Missing", missing, delta=f"{missing/total*100:.1f}%" if total > 0 else "0%")
+                col3.metric("⚫ Not Applicable", not_applicable, delta=f"{not_applicable/total*100:.1f}%" if total > 0 else "0%")
+                col4.metric("❓ Unclear", unclear, delta=f"{unclear/total*100:.1f}%" if total > 0 else "0%")
+                
+                # Completion percentage
+                completion_rate = (present / (present + missing)) * 100 if (present + missing) > 0 else 0
+                st.metric("📈 Completion Rate", f"{completion_rate:.1f}%", 
+                         help="Percentage of applicable requirements that are present")
+                
+                # Progress bar for completion
+                st.progress(completion_rate / 100)
+                
+                # Detailed results with filters
+                st.subheader("📋 Detailed Requirements Review")
+                
+                # Filter options
+                status_filter = st.selectbox(
+                    "Filter by status:", 
+                    ["All", "Present", "Missing", "Not Applicable", "Unclear"]
+                )
+                
+                # Prepare rows for display
+                checklist_items = final_state.checklist.submittals if final_state.checklist else []
+                rows = []
+                for i, finding in enumerate(final_state.findings):
+                    # Apply filter
+                    if status_filter != "All" and finding.status.replace("_", " ").title() != status_filter:
+                        continue
+                        
+                    req_text = checklist_items[i].text if i < len(checklist_items) else finding.req_id
+                    
+                    # Enhanced status with emoji
+                    status_map = {
+                        "present": "✅ PRESENT",
+                        "missing": "❌ MISSING", 
+                        "not_applicable": "⚫ NOT APPLICABLE",
+                        "unclear": "❓ UNCLEAR"
+                    }
+                    
+                    rows.append({
+                        "Requirement": req_text,
+                        "Status": status_map.get(finding.status, finding.status.upper()),
+                        "Evidence": finding.evidence
+                    })
+                
+                if rows:
+                    _render_rows_with_columns(st, rows)
+                else:
+                    st.info("No requirements match the selected filter.")
 
 if __name__ == "__main__":
     main()

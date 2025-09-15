@@ -2,7 +2,7 @@ import json
 from typing import Dict, Any
 
 class PromptManager:
-    def __init__(self, prompts_file: str = "prompts.json"):
+    def __init__(self, prompts_file: str = "prompts/prompts.json"):
         self.prompts_file = prompts_file
         self._prompts = None
     
@@ -27,9 +27,9 @@ class PromptManager:
         try:
             template = self.prompts[category][template_key]
             return template.format(**kwargs)
-        except KeyError as e:
+        except KeyError:
             raise KeyError(f"Prompt not found: {category}.{template_key}")
-        except KeyError as e:
+        except Exception as e:
             raise ValueError(f"Missing template variable: {e}")
     
     def get_system_prompt(self, category: str) -> str:
